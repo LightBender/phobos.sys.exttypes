@@ -1,5 +1,3 @@
-// Written in the D programming language.
-
 /**
  * IEEE 754-2008 compliant decimal floating-point arithmetic.
  *
@@ -1758,7 +1756,11 @@ pure nothrow @safe @nogc:
             return encodeInfinity(rsign);
         }
         if (b.isInfinity())
-            return roundToPrecision(rsign, UInt256(0), Format.qmin, mode, flags);
+        {
+            // finite / ∞ = ±0; keep the dividend's exponent as the cohort.
+            immutable da0 = a.decode();
+            return roundToPrecision(rsign, UInt256(0), da0.exponent, mode, flags);
+        }
 
         immutable da = a.decode();
         immutable db = b.decode();
@@ -3307,5 +3309,283 @@ private auto dstr(int bits)(string s)
     static assert(sum.toString() == "0.3");
 }
 
+/*
+ * ----------------------------------------------------------------------
+ * IBM FPgen decimal conformance vectors.
+ *
+ * The IBM FPgen ("Floating-Point Test Suite for IEEE") describes each test
+ * as a single line. The decimal subset exercised here uses the format:
+ *
+ *     <fmt><op> <rounding> <operands...> -> <result> [flags]
+ *
+ *   fmt        d32 | d64 | d128
+ *   op         +   add            -   subtract       *   multiply
+ *              /   divide         *+  fused mul-add   V   square root
+ *              %   IEEE remainder
+ *   rounding   =0  nearest, ties to even   =^  nearest, ties away
+ *              0   toward zero             <   toward -Inf   >   toward +Inf
+ *   operand    <sign><digits>P<exp>  (value = digits × 10^exp, cohort exact)
+ *              +Inf | -Inf | Q (qNaN) | S (sNaN)
+ *   flags      any of  x inexact  u underflow  o overflow
+ *                      z division-by-zero      i invalid-operation
+ *
+ * Each vector checks both the produced value (including the IEEE preferred
+ * exponent / cohort, via the raw encoding) and the exact status flags.
+ * ----------------------------------------------------------------------
+ */
+version (unittest)
+{
+    private string[] fpSplit(string s)
+    {
+        string[] r;
+        size_t i = 0;
+        while (i < s.length)
+        {
+            while (i < s.length && s[i] == ' ') ++i;
+            immutable st = i;
+            while (i < s.length && s[i] != ' ') ++i;
+            if (i > st) r ~= s[st .. i];
+        }
+        return r;
+    }
 
+    private RoundingMode fpRounding(string r)
+    {
+        switch (r)
+        {
+            case "=0": return RoundingMode.roundTiesToEven;
+            case "=^": return RoundingMode.roundTiesToAway;
+            case "0":  return RoundingMode.roundTowardZero;
+            case "<":  return RoundingMode.roundTowardNegative;
+            case ">":  return RoundingMode.roundTowardPositive;
+            default: assert(false, "FPgen: bad rounding mode '" ~ r ~ "'");
+        }
+    }
 
+    private ExceptionFlag fpFlags(string s)
+    {
+        ExceptionFlag f;
+        foreach (c; s) switch (c)
+        {
+            case 'x': f |= ExceptionFlag.inexact; break;
+            case 'u': f |= ExceptionFlag.underflow; break;
+            case 'o': f |= ExceptionFlag.overflow; break;
+            case 'z': f |= ExceptionFlag.divisionByZero; break;
+            case 'i': f |= ExceptionFlag.invalidOperation; break;
+            default: assert(false, "FPgen: bad flag char");
+        }
+        return f;
+    }
+
+    private string fpFlagDump(ExceptionFlag f)
+    {
+        string s;
+        if (f & ExceptionFlag.invalidOperation) s ~= "i";
+        if (f & ExceptionFlag.divisionByZero)   s ~= "z";
+        if (f & ExceptionFlag.overflow)         s ~= "o";
+        if (f & ExceptionFlag.underflow)        s ~= "u";
+        if (f & ExceptionFlag.inexact)          s ~= "x";
+        return s.length ? s : "(none)";
+    }
+
+    private Decimal!bits fpParse(int bits)(string tok)
+    {
+        alias D = Decimal!bits;
+        if (tok == "+Inf") return D.infinity();
+        if (tok == "-Inf") return D.infinity().negated();
+        if (tok == "Q")    return D.nan();
+        if (tok == "S")
+        {
+            D d;
+            ExceptionFlag f;
+            D.fromString("sNaN", d, f);
+            return d;
+        }
+        // <sign><digits>P<exp>
+        string num;
+        size_t i = 0;
+        if (tok[0] == '+') i = 1;
+        else if (tok[0] == '-') { num = "-"; i = 1; }
+        size_t p = i;
+        while (p < tok.length && tok[p] != 'P') ++p;
+        num ~= tok[i .. p];
+        string es = (p < tok.length) ? tok[p + 1 .. $] : "0";
+        D d;
+        ExceptionFlag f;
+        immutable ok = D.fromString(num ~ "E" ~ es, d, f);
+        assert(ok, "FPgen: bad operand '" ~ tok ~ "'");
+        return d;
+    }
+
+    private void fpCheck(int bits)(Decimal!bits got, string tok, string line)
+    {
+        if (tok == "Q")    { assert(got.isNaN() && !got.isSignalingNaN(), line); return; }
+        if (tok == "S")    { assert(got.isSignalingNaN(), line); return; }
+        if (tok == "+Inf") { assert(got.isInfinity() && !got.signbit(), line); return; }
+        if (tok == "-Inf") { assert(got.isInfinity() && got.signbit(), line); return; }
+        immutable want = fpParse!bits(tok);
+        assert(got.rawValue() == want.rawValue(),
+            line ~ "  [got " ~ got.toString() ~ "]");
+    }
+
+    private void runFPgen(int bits)(string line)
+    {
+        alias D = Decimal!bits;
+        auto tok = fpSplit(line);
+        size_t arrow = tok.length;
+        foreach (k, t; tok) if (t == "->") { arrow = k; break; }
+        assert(arrow < tok.length, "FPgen: missing '->' in: " ~ line);
+
+        immutable opspec = tok[0];
+        immutable mode = fpRounding(tok[1]);
+        auto ops = tok[2 .. arrow];
+        immutable resTok = tok[arrow + 1];
+        immutable flagTok = (arrow + 2 < tok.length) ? tok[arrow + 2] : "";
+
+        size_t j = 1;                       // skip 'd' then the width digits
+        while (j < opspec.length && opspec[j] >= '0' && opspec[j] <= '9') ++j;
+        immutable sym = opspec[j .. $];
+
+        ExceptionFlag f;
+        D got;
+        switch (sym)
+        {
+            case "+":
+                got = D.add(fpParse!bits(ops[0]), fpParse!bits(ops[1]), mode, f);
+                break;
+            case "-":
+                got = D.sub(fpParse!bits(ops[0]), fpParse!bits(ops[1]), mode, f);
+                break;
+            case "*":
+                got = D.mul(fpParse!bits(ops[0]), fpParse!bits(ops[1]), mode, f);
+                break;
+            case "/":
+                got = D.div(fpParse!bits(ops[0]), fpParse!bits(ops[1]), mode, f);
+                break;
+            case "*+":
+                got = D.fma(fpParse!bits(ops[0]), fpParse!bits(ops[1]),
+                            fpParse!bits(ops[2]), mode, f);
+                break;
+            case "V":
+                got = D.sqrt(fpParse!bits(ops[0]), mode, f);
+                break;
+            case "%":
+                got = D.remainder(fpParse!bits(ops[0]), fpParse!bits(ops[1]), f);
+                break;
+            default:
+                assert(false, "FPgen: unsupported operation '" ~ sym ~ "'");
+        }
+
+        fpCheck!bits(got, resTok, line);
+        assert(f == fpFlags(flagTok),
+            line ~ "  [flags got " ~ fpFlagDump(f) ~ "]");
+    }
+}
+
+@safe unittest
+{
+    // FPgen — decimal64 addition / subtraction.
+    static immutable string[] vectors = [
+        "d64+ =0 1P0 1P0 -> 2P0",
+        "d64+ =0 1P0 2P0 -> 3P0",
+        "d64+ =0 12P-1 34P-1 -> 46P-1",
+        "d64+ =0 1P0 -1P0 -> 0P0",
+        "d64+ =0 25P-1 25P-1 -> 50P-1",
+        "d64+ =0 +Inf 1P0 -> +Inf",
+        "d64+ =0 +Inf -Inf -> Q i",
+        "d64+ =0 Q 1P0 -> Q",
+        "d64+ =0 S 1P0 -> Q i",
+        "d64- =0 5P0 5P0 -> 0P0",
+        "d64- =0 30P-1 12P-1 -> 18P-1",
+        "d64- =0 1P0 +Inf -> -Inf",
+    ];
+    foreach (v; vectors) runFPgen!64(v);
+}
+
+@safe unittest
+{
+    // FPgen — decimal64 multiplication.
+    static immutable string[] vectors = [
+        "d64* =0 2P0 3P0 -> 6P0",
+        "d64* =0 10P-1 10P-1 -> 100P-2",
+        "d64* =0 -2P0 3P0 -> -6P0",
+        "d64* =0 1P0 0P0 -> 0P0",
+        "d64* =0 15P-1 0P0 -> 0P-1",
+        "d64* =0 0P0 +Inf -> Q i",
+        "d64* =0 -2P0 +Inf -> -Inf",
+    ];
+    foreach (v; vectors) runFPgen!64(v);
+}
+
+@safe unittest
+{
+    // FPgen — decimal64 division, including the directed rounding modes.
+    static immutable string[] vectors = [
+        "d64/ =0 6P0 2P0 -> 3P0",
+        "d64/ =0 1P0 2P0 -> 5P-1",
+        "d64/ =0 1P0 8P0 -> 125P-3",
+        "d64/ =0 1P0 3P0 -> 3333333333333333P-16 x",
+        "d64/ > 1P0 3P0 -> 3333333333333334P-16 x",
+        "d64/ < 1P0 3P0 -> 3333333333333333P-16 x",
+        "d64/ 0 1P0 3P0 -> 3333333333333333P-16 x",
+        "d64/ =0 2P0 3P0 -> 6666666666666667P-16 x",
+        "d64/ > 2P0 3P0 -> 6666666666666667P-16 x",
+        "d64/ < 2P0 3P0 -> 6666666666666666P-16 x",
+        "d64/ 0 2P0 3P0 -> 6666666666666666P-16 x",
+        "d64/ =0 1P0 0P0 -> +Inf z",
+        "d64/ =0 0P0 0P0 -> Q i",
+        "d64/ =0 +Inf +Inf -> Q i",
+        "d64/ =0 5P0 +Inf -> 0P0",
+    ];
+    foreach (v; vectors) runFPgen!64(v);
+}
+
+@safe unittest
+{
+    // FPgen — decimal64 fused multiply-add, square root and remainder.
+    static immutable string[] vectors = [
+        "d64*+ =0 2P0 3P0 1P0 -> 7P0",
+        "d64*+ =0 15P-1 15P-1 75P-2 -> 300P-2",
+        "d64*+ =0 0P0 +Inf 1P0 -> Q i",
+        "d64V =0 4P0 -> 2P0",
+        "d64V =0 9P0 -> 3P0",
+        "d64V =0 25P-2 -> 5P-1",
+        "d64V =0 2P0 -> 1414213562373095P-15 x",
+        "d64V =0 -1P0 -> Q i",
+        "d64V =0 +Inf -> +Inf",
+        "d64% =0 5P0 3P0 -> -1P0",
+        "d64% =0 7P0 3P0 -> 1P0",
+        "d64% =0 10P0 3P0 -> 1P0",
+        "d64% =0 9P0 3P0 -> 0P0",
+        "d64% =0 1P0 0P0 -> Q i",
+    ];
+    foreach (v; vectors) runFPgen!64(v);
+}
+
+@safe unittest
+{
+    // FPgen — decimal32 overflow and underflow boundaries (emax 96, qmin -101).
+    static immutable string[] vectors = [
+        "d32* =0 9999999P90 10P0 -> +Inf ox",
+        "d32* > 9999999P90 10P0 -> +Inf ox",
+        "d32* < 9999999P90 10P0 -> 9999999P90 ox",
+        "d32/ =0 1P-101 10P0 -> 0P-101 ux",
+        "d32+ =0 1P0 1P0 -> 2P0",
+        "d32* =0 -9999999P90 10P0 -> -Inf ox",
+    ];
+    foreach (v; vectors) runFPgen!32(v);
+}
+
+@safe unittest
+{
+    // FPgen — decimal128 full-width coefficients.
+    static immutable string[] vectors = [
+        "d128* =0 11P-1 11P-1 -> 121P-2",
+        "d128+ =0 1234567890123456789012345678901234P-2 1P-2"
+            ~ " -> 1234567890123456789012345678901235P-2",
+        "d128/ =0 1P0 3P0 ->"
+            ~ " 3333333333333333333333333333333333P-34 x",
+        "d128V =0 4P0 -> 2P0",
+    ];
+    foreach (v; vectors) runFPgen!128(v);
+}
