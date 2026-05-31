@@ -1,0 +1,5 @@
+name "phobos-sys-exttypes"
+description "Candidate types for inclusion in Phobos 3."
+authors "Adam Wilson"
+copyright "Copyright © 2026, Adam Wilson"
+license "BSL-1.0"
