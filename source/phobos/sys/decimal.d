@@ -1702,14 +1702,18 @@ pure nothrow @safe @nogc:
         }
 
         // Far apart: the dominant term carries the result and the other becomes
-        // a sticky digit just below the dominant's least significant place.
+        // a single sticky unit, placed `precision + 2` digits below the
+        // dominant's leading digit so that rounding sees the correct
+        // inexactness regardless of how many digits the dominant term has.
         bool sd, so;
         UInt256 cd;
         int qd;
         if (adjA >= adjB) { sd = sa; cd = ca; qd = qa; so = sb; }
         else { sd = sb; cd = cb; qd = qb; so = sa; }
-        immutable cd2 = (sd == so) ? cd.mulSmall(10) + UInt256(1) : cd.mulSmall(10) - UInt256(1);
-        return roundToPrecision(sd, cd2, qd - 1, mode, flags);
+        immutable workExp = qd - (Format.precision + 2);
+        immutable scaled = scaleU256(cd, qd - workExp);
+        immutable cd2 = (sd == so) ? scaled + UInt256(1) : scaled - UInt256(1);
+        return roundToPrecision(sd, cd2, workExp, mode, flags);
     }
 
     /// Remove trailing zero digits while the exponent stays below `preferredExp`.
@@ -3573,6 +3577,319 @@ private auto dstr(int bits)(string s)
 
 /*
  * ----------------------------------------------------------------------
+ * Additional coverage tests.
+ *
+ * These exercise production paths that the conformance vectors and earlier
+ * edge-case blocks leave untouched: the 128-bit limb helpers, the integer
+ * and binary-float conversions, and the assorted special-case branches of
+ * the elementary operations (logB, scaleB, quantize, nextUp/nextDown,
+ * totalOrder, sqrt, remainder, division and far-apart addition).
+ * ----------------------------------------------------------------------
+ */
+
+@safe unittest
+{
+    // --- UInt128 limb helpers (only fully exercised by decimal128) -------
+    assert(UInt128(0).isZero());
+    assert(!UInt128(1, 0).isZero());
+    assert(UInt128(0xFF) == 0xFFUL);
+    assert(!(UInt128(1, 0) == 0UL));
+
+    immutable inv = ~UInt128(0);
+    assert(inv.hi == ulong.max && inv.lo == ulong.max);
+
+    assert((UInt128(1) << 0) == UInt128(1));
+    assert((UInt128(0xF) << 4) == UInt128(0xF0));
+    assert((UInt128(1) << 64) == UInt128(1, 0));
+    assert((UInt128(1) << 200).isZero());
+
+    assert((UInt128(1, 0) >> 0) == UInt128(1, 0));
+    assert((UInt128(0xF0) >> 4) == UInt128(0xF));
+    assert((UInt128(1, 0) >> 64) == UInt128(1));
+    assert((UInt128(1) >> 200).isZero());
+}
+
+@safe unittest
+{
+    // --- epsilon() ------------------------------------------------------
+    assert(Decimal32.epsilon().decode().coefficient == 1);
+    assert(Decimal32.epsilon().decode().exponent == 1 - 7);
+    assert(Decimal64.epsilon().decode().exponent == 1 - 16);
+    assert(Decimal128.epsilon().decode().exponent == 1 - 34);
+}
+
+@safe unittest
+{
+    import core.math : fabs;
+
+    // --- Conversion to binary floating point ----------------------------
+    assert(Decimal64.infinity().toReal() == real.infinity);
+    assert(Decimal64.infinity().negated().toReal() == -real.infinity);
+    immutable qn = Decimal64.nan().toReal();
+    assert(qn != qn);                                        // NaN
+    immutable sn = dstr!64("sNaN").toReal();
+    assert(sn != sn);
+
+    assert(fabs(dstr!64("2.5").toReal() - 2.5L) < 1e-15L);
+    assert(dstr!64("100").toDouble() == 100.0);
+    assert(dstr!64("0.5").toFloat() == 0.5f);
+    assert(Decimal64.infinity().toDouble() == double.infinity);
+    assert(Decimal64.infinity().toFloat() == float.infinity);
+    immutable dn = Decimal64.nan().toFloat();
+    assert(dn != dn);
+}
+
+@safe unittest
+{
+    // --- Conversion from binary floating point --------------------------
+    assert(Decimal64.fromDouble(double.infinity).isInfinity());
+    auto ni = Decimal64.fromDouble(-double.infinity);
+    assert(ni.isInfinity() && ni.signbit());
+    assert(Decimal64.fromDouble(double.nan).isNaN());
+    assert(Decimal64.fromDouble(-double.nan).isNaN());
+
+    auto pz = Decimal64.fromDouble(0.0);
+    assert(pz.isZero() && !pz.signbit());
+    auto nz = Decimal64.fromDouble(-0.0);
+    assert(nz.isZero() && nz.signbit());
+
+    // Exact dyadic fractions round-trip (negative-exponent fast path).
+    assert(Decimal64.fromDouble(0.5).toDouble() == 0.5);
+    assert(Decimal64.fromDouble(0.25).toDouble() == 0.25);
+    assert(Decimal64.fromDouble(-3.125).toDouble() == -3.125);
+
+    // Large integer magnitude (non-negative binary exponent fast path).
+    immutable big = cast(double)(1UL << 60);
+    assert(Decimal64.fromDouble(big).toDouble() == big);
+
+    // Subnormal double (biased exponent 0, nonzero fraction).
+    auto subd = Decimal64.fromDouble(double.min_normal / 4);
+    assert(subd.isFinite() && !subd.isZero());
+
+    // Very large/small magnitudes fall back through `real`.
+    assert(Decimal64.fromDouble(1e300).isFinite());
+    assert(Decimal64.fromDouble(1e-300).isFinite());
+
+    // fromFloat delegates to fromDouble.
+    assert(Decimal64.fromFloat(1.5f).toDouble() == 1.5);
+}
+
+@safe unittest
+{
+    // --- Integer and cross-width constructors ---------------------------
+    assert(Decimal64(123u).toString() == "123");          // this(uint)
+    assert(Decimal64(456u).toString() == "456");
+    assert(Decimal64(ulong.max).isFinite());              // this(ulong)
+    assert(Decimal64(-789).toString() == "-789");         // this(int) -> this(long)
+    assert(Decimal64(cast(long) 1000).toString() == "1000");
+
+    // Cross-width construction covers every DecKind branch.
+    assert(Decimal32(dstr!64("1.5")).toString() == "1.5");
+    assert(Decimal128(Decimal64.infinity()).isInfinity());
+    assert(Decimal128(Decimal64.nan()).isNaN());
+    assert(Decimal128(dstr!64("sNaN")).isSignalingNaN());
+}
+
+@safe unittest
+{
+    ExceptionFlag f;
+
+    // --- logB -----------------------------------------------------------
+    assert(Decimal64.logB(Decimal64.infinity(), f).isInfinity());
+    f = ExceptionFlag.none;
+    auto lz = Decimal64.logB(dstr!64("0"), f);
+    assert(lz.isInfinity() && lz.signbit() && (f & ExceptionFlag.divisionByZero));
+    f = ExceptionFlag.none;
+    assert(Decimal64.logB(dstr!64("NaN"), f).isNaN());
+
+    // --- scaleB ---------------------------------------------------------
+    f = ExceptionFlag.none;
+    assert(Decimal64.scaleB(dstr!64("0"), 5, RoundingMode.roundTiesToEven, f).isZero());
+    assert(Decimal64.scaleB(Decimal64.infinity(), 3, RoundingMode.roundTiesToEven, f).isInfinity());
+    assert(Decimal64.scaleB(dstr!64("NaN"), 3, RoundingMode.roundTiesToEven, f).isNaN());
+}
+
+@safe unittest
+{
+    ExceptionFlag f;
+
+    // --- quantize -------------------------------------------------------
+    // Result needing more than `precision` digits is invalid.
+    auto q = Decimal64.quantize(dstr!64("1234567890123456"), dstr!64("1E-1"),
+        RoundingMode.roundTiesToEven, f);
+    assert(q.isNaN() && (f & ExceptionFlag.invalidOperation));
+
+    f = ExceptionFlag.none;
+    assert(Decimal64.quantize(Decimal64.infinity(), Decimal64.infinity(),
+        RoundingMode.roundTiesToEven, f).isInfinity());
+
+    f = ExceptionFlag.none;
+    assert(Decimal64.quantize(Decimal64.infinity(), dstr!64("1"),
+        RoundingMode.roundTiesToEven, f).isNaN() && (f & ExceptionFlag.invalidOperation));
+
+    f = ExceptionFlag.none;
+    assert(Decimal64.quantize(dstr!64("NaN"), dstr!64("1"),
+        RoundingMode.roundTiesToEven, f).isNaN());
+
+    // Directed rounding to a coarser quantum exercises the divPow10Round
+    // toward-positive / toward-negative branches.
+    f = ExceptionFlag.none;
+    assert(Decimal64.quantize(dstr!64("1.25"), dstr!64("1E-1"),
+        RoundingMode.roundTowardPositive, f).toString() == "1.3");
+    assert(Decimal64.quantize(dstr!64("1.25"), dstr!64("1E-1"),
+        RoundingMode.roundTowardNegative, f).toString() == "1.2");
+}
+
+@safe unittest
+{
+    ExceptionFlag f;
+
+    // --- nextUp / nextDown ----------------------------------------------
+    auto nu = Decimal64.nextUp(Decimal64.infinity().negated(), f);
+    assert(nu.isFinite() && nu.signbit());                  // -inf -> -max
+    assert(Decimal64.nextUp(Decimal64.infinity(), f).isInfinity());
+    assert(Decimal64.nextUp(dstr!64("NaN"), f).isNaN());
+
+    auto up0 = Decimal64.nextUp(dstr!64("0"), f);
+    assert(up0.isFinite() && !up0.signbit() && !up0.isZero());   // +trueMin
+    auto dn0 = Decimal64.nextDown(dstr!64("0"), f);
+    assert(dn0.isFinite() && dn0.signbit() && !dn0.isZero());    // -trueMin
+
+    // nextUp then nextDown returns to the original cohort value.
+    auto v = dstr!64("1");
+    assert(Decimal64.isEqual(Decimal64.nextDown(Decimal64.nextUp(v, f), f), v));
+}
+
+@safe unittest
+{
+    // --- totalOrder -----------------------------------------------------
+    assert(Decimal64.totalOrder(dstr!64("-0"), dstr!64("0")) == -1);
+    assert(Decimal64.totalOrder(dstr!64("0"), dstr!64("0")) == 0);
+
+    // Equal numeric value, distinguished by exponent (cohort).
+    assert(Decimal64.totalOrder(dstr!64("1.0"), dstr!64("1.00")) == 1);
+    assert(Decimal64.totalOrder(dstr!64("-1.0"), dstr!64("-1.00")) == -1);
+
+    // NaNs ordered by payload, reversed when negative.
+    assert(Decimal64.totalOrder(dstr!64("NaN1"), dstr!64("NaN2")) == -1);
+    assert(Decimal64.totalOrder(dstr!64("-NaN1"), dstr!64("-NaN2")) == 1);
+
+    // Broad-class ordering.
+    assert(Decimal64.totalOrder(dstr!64("-Inf"), dstr!64("Inf")) == -1);
+    assert(Decimal64.totalOrder(dstr!64("1"), dstr!64("2")) == -1);
+}
+
+@safe unittest
+{
+    ExceptionFlag f;
+
+    // --- sqrt specials --------------------------------------------------
+    assert(Decimal64.sqrt(dstr!64("NaN"), RoundingMode.roundTiesToEven, f).isNaN());
+    f = ExceptionFlag.none;
+    assert(Decimal64.sqrt(dstr!64("-4"), RoundingMode.roundTiesToEven, f).isNaN()
+        && (f & ExceptionFlag.invalidOperation));
+    f = ExceptionFlag.none;
+    assert(Decimal64.sqrt(Decimal64.infinity(), RoundingMode.roundTiesToEven, f).isInfinity());
+
+    // --- remainder specials ---------------------------------------------
+    f = ExceptionFlag.none;
+    assert(Decimal64.remainder(dstr!64("NaN"), dstr!64("1"), f).isNaN());
+    assert(Decimal64.remainder(Decimal64.infinity(), dstr!64("1"), f).isNaN()
+        && (f & ExceptionFlag.invalidOperation));
+    f = ExceptionFlag.none;
+    assert(Decimal64.remainder(dstr!64("5"), dstr!64("0"), f).isNaN()
+        && (f & ExceptionFlag.invalidOperation));
+
+    // --- division specials ----------------------------------------------
+    f = ExceptionFlag.none;
+    auto dz = Decimal64.div(dstr!64("1"), dstr!64("0"), RoundingMode.roundTiesToEven, f);
+    assert(dz.isInfinity() && (f & ExceptionFlag.divisionByZero));
+    assert(Decimal64.div(dstr!64("NaN"), dstr!64("1"), RoundingMode.roundTiesToEven, f).isNaN());
+}
+
+@safe unittest
+{
+    ExceptionFlag f;
+
+    // --- Far-apart operands (sticky-bit alignment paths) ----------------
+    auto r = Decimal64.add(dstr!64("1E50"), dstr!64("1E-50"),
+        RoundingMode.roundTiesToEven, f);
+    assert(Decimal64.isEqual(r, dstr!64("1E50")) && (f & ExceptionFlag.inexact));
+
+    f = ExceptionFlag.none;
+    auto r2 = Decimal64.add(dstr!64("1E-50"), dstr!64("1E50"),
+        RoundingMode.roundTiesToEven, f);
+    assert(Decimal64.isEqual(r2, dstr!64("1E50")) && (f & ExceptionFlag.inexact));
+
+    // Directed rounding nudges the tiny far operand up.
+    f = ExceptionFlag.none;
+    auto r3 = Decimal64.add(dstr!64("1E50"), dstr!64("1E-50"),
+        RoundingMode.roundTowardPositive, f);
+    bool unordered;
+    assert(Decimal64.compareValue(r3, dstr!64("1E50"), unordered) >= 0);
+
+    // fma with a far-apart addend keeps the full product before rounding.
+    f = ExceptionFlag.none;
+    auto r4 = Decimal64.fma(dstr!64("1E40"), dstr!64("1E40"), dstr!64("1E-40"),
+        RoundingMode.roundTiesToEven, f);
+    assert(Decimal64.isEqual(r4, dstr!64("1E80")) && (f & ExceptionFlag.inexact));
+}
+
+@safe unittest
+{
+    ExceptionFlag f;
+
+    // --- fma infinity specials ------------------------------------------
+    // ∞ × 0 is invalid.
+    assert(Decimal64.fma(Decimal64.infinity(), dstr!64("0"), dstr!64("1"),
+        RoundingMode.roundTiesToEven, f).isNaN() && (f & ExceptionFlag.invalidOperation));
+    // Finite product plus an infinite addend is that infinity.
+    f = ExceptionFlag.none;
+    assert(Decimal64.fma(dstr!64("2"), dstr!64("3"), Decimal64.infinity(),
+        RoundingMode.roundTiesToEven, f).isInfinity());
+    // Infinite product plus a finite addend stays infinite.
+    f = ExceptionFlag.none;
+    assert(Decimal64.fma(Decimal64.infinity(), dstr!64("2"), dstr!64("5"),
+        RoundingMode.roundTiesToEven, f).isInfinity());
+    // (+∞) + (−∞) is invalid.
+    f = ExceptionFlag.none;
+    assert(Decimal64.fma(Decimal64.infinity(), dstr!64("1"),
+        Decimal64.infinity().negated(), RoundingMode.roundTiesToEven, f).isNaN()
+        && (f & ExceptionFlag.invalidOperation));
+}
+
+@safe unittest
+{
+    ExceptionFlag f;
+
+    // --- divPow10Round large-divisor branch (drop >= 77) ----------------
+    // Quantizing a minute value to a very coarse quantum drops every digit;
+    // directed rounding then decides between 0 and one unit in the last place.
+    auto up = Decimal64.quantize(dstr!64("1E-100"), dstr!64("1E10"),
+        RoundingMode.roundTowardPositive, f);
+    assert(up.toString() == "1E+10" && (f & ExceptionFlag.inexact));
+    f = ExceptionFlag.none;
+    auto dn = Decimal64.quantize(dstr!64("-1E-100"), dstr!64("1E10"),
+        RoundingMode.roundTowardNegative, f);
+    assert(dn.toString() == "-1E+10" && (f & ExceptionFlag.inexact));
+    f = ExceptionFlag.none;
+    auto tz = Decimal64.quantize(dstr!64("1E-100"), dstr!64("1E10"),
+        RoundingMode.roundTowardZero, f);
+    assert(tz.isZero() && (f & ExceptionFlag.inexact));
+
+    // --- normalizeShortest trailing-zero removal ------------------------
+    // Exact powers of ten convert with trailing zeros that get stripped.
+    assert(Decimal64.fromDouble(100.0).toDouble() == 100.0);
+    assert(Decimal64.fromDouble(1000000.0).toDouble() == 1000000.0);
+
+    // --- NaN payload formatting -----------------------------------------
+    assert(dstr!64("NaN123").toString() == "NaN123");
+    assert(dstr!64("sNaN7").toString() == "sNaN7");
+    assert(dstr!64("-NaN42").toString() == "-NaN42");
+}
+
+/*
+ * ----------------------------------------------------------------------
  * IBM FPgen decimal conformance vectors.
  *
  * The IBM FPgen ("Floating-Point Test Suite for IEEE") describes each test
@@ -4296,4 +4613,3 @@ version (unittest)
     assert(f & ExceptionFlag.overflow);
     assert(f & ExceptionFlag.inexact);
 }
-

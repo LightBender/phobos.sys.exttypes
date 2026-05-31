@@ -5,3 +5,5 @@ Can you implement unit tests that cover the decimal portion of the IBM FPgen tes
 Next I would like to add unit tests that replicate the TestFloat suite from John Hauser. You can place them after the FPgen tests.
 
 Finally I would like to add tests to cover edge cases beyond basic vectors including: all four rounding modes, subnormal handling and tininess detection, NaN payload propagation (quiet vs. signaling), decimal-specific features (if supported), fused multiply-add (FMA) exactness, and reproducible results across implementations. You do not need to reproduce any edge case tests that the existing unit tests already handle. You can add them between the Phase 6 tests and that FPgen tests.
+
+Using the attached code coverage file, can you determine if there are any additional tests that could be added to improve coverage? 100% is not a hard requirement. Please add any new tests above the FPgen tests.
