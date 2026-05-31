@@ -3311,6 +3311,268 @@ private auto dstr(int bits)(string s)
 
 /*
  * ----------------------------------------------------------------------
+ * Targeted edge cases beyond the basic vectors.
+ *
+ * These complement (rather than repeat) the conformance suites below,
+ * focusing on interactions the simple vectors do not isolate: rounding of
+ * subnormal results under every mode, tininess detection, NaN-payload
+ * propagation with quiet/signaling distinction, decimal-specific cohort and
+ * quantum behaviour, fused-multiply-add exactness, and bit-reproducible
+ * encodings (including non-canonical decoding).
+ * ----------------------------------------------------------------------
+ */
+
+@safe unittest
+{
+    // Rounding of a subnormal, inexact result under all five modes.
+    // 1.5E-101 is unrepresentable in decimal32 (quantum at qmin is 1E-101);
+    // it must round to either 1E-101 or 2E-101 depending on the mode, always
+    // raising both underflow (tininess + loss) and inexact.
+    static Decimal32 r(string s, RoundingMode m)
+    {
+        Decimal32 d;
+        ExceptionFlag f;
+        Decimal32.fromString(s, d, f, m);
+        assert(d.isSubnormal, s);
+        assert(f & ExceptionFlag.underflow, s);    // tininess detected after rounding
+        assert(f & ExceptionFlag.inexact, s);
+        return d;
+    }
+
+    assert(r("1.5E-101", RoundingMode.roundTiesToEven).rawValue()
+        == dstr!32("2E-101").rawValue());          // tie -> even (2)
+    assert(r("1.5E-101", RoundingMode.roundTiesToAway).rawValue()
+        == dstr!32("2E-101").rawValue());
+    assert(r("1.5E-101", RoundingMode.roundTowardZero).rawValue()
+        == dstr!32("1E-101").rawValue());
+    assert(r("1.5E-101", RoundingMode.roundTowardNegative).rawValue()
+        == dstr!32("1E-101").rawValue());
+    assert(r("1.5E-101", RoundingMode.roundTowardPositive).rawValue()
+        == dstr!32("2E-101").rawValue());
+
+    // Negative subnormal: the directed modes swap sense.
+    Decimal32 d;
+    ExceptionFlag f;
+    Decimal32.fromString("-1.5E-101", d, f, RoundingMode.roundTowardNegative);
+    assert(d.rawValue() == dstr!32("-2E-101").rawValue());
+    f = ExceptionFlag.none;
+    Decimal32.fromString("-1.5E-101", d, f, RoundingMode.roundTowardPositive);
+    assert(d.rawValue() == dstr!32("-1E-101").rawValue());
+}
+
+@safe unittest
+{
+    // Tininess detection: a tiny result is flagged underflow only when it is
+    // also inexact. An exact subnormal is tiny but raises no flag.
+    ExceptionFlag f;
+
+    // Exact subnormal via scaleB: 123 x 10^-101 (3 digits, no rounding).
+    auto exact = Decimal32.scaleB(dstr!32("123"), -101, RoundingMode.roundTiesToEven, f);
+    assert(exact.isSubnormal);
+    assert(f == ExceptionFlag.none);               // tiny but exact -> no underflow
+
+    // Inexact subnormal via multiply: 1.234567E-95 x 1E-3 rounds at the quantum.
+    f = ExceptionFlag.none;
+    auto inexact = Decimal32.mul(dstr!32("1.234567E-95"), dstr!32("1E-3"),
+        RoundingMode.roundTiesToEven, f);
+    assert(inexact.isSubnormal);
+    assert(inexact.rawValue() == dstr!32("1235E-101").rawValue());
+    assert(f & ExceptionFlag.underflow);
+    assert(f & ExceptionFlag.inexact);
+
+    // A value below half the smallest subnormal flushes to zero, still tiny
+    // and inexact.
+    f = ExceptionFlag.none;
+    auto tiny = Decimal32.mul(dstr!32("1E-95"), dstr!32("1E-10"),
+        RoundingMode.roundTiesToEven, f);
+    assert(tiny.isZero);
+    assert(f & ExceptionFlag.underflow);
+    assert(f & ExceptionFlag.inexact);
+}
+
+@safe unittest
+{
+    // NaN payload propagation, with the quiet/signaling distinction.
+    // The payload of a NaN is carried in its coefficient field.
+    ExceptionFlag f;
+
+    // Signaling NaN operand: result is the *quieted* NaN, payload preserved,
+    // and the invalid-operation flag is raised exactly once.
+    auto r1 = Decimal64.add(dstr!64("sNaN123"), dstr!64("1"),
+        RoundingMode.roundTiesToEven, f);
+    assert(r1.isNaN() && !r1.isSignalingNaN());
+    assert(r1.decode().coefficient == 123UL);
+    assert(f == ExceptionFlag.invalidOperation);
+
+    // Quiet NaN operand: payload preserved, no flag.
+    f = ExceptionFlag.none;
+    auto r2 = Decimal64.add(dstr!64("NaN456"), dstr!64("1"),
+        RoundingMode.roundTiesToEven, f);
+    assert(r2.isNaN() && !r2.isSignalingNaN());
+    assert(r2.decode().coefficient == 456UL);
+    assert(f == ExceptionFlag.none);
+
+    // When only the second operand is NaN, its payload is taken.
+    f = ExceptionFlag.none;
+    auto r3 = Decimal64.mul(dstr!64("2"), dstr!64("NaN789"),
+        RoundingMode.roundTiesToEven, f);
+    assert(r3.decode().coefficient == 789UL);
+
+    // Two NaN operands: the first operand wins.
+    auto r4 = Decimal64.add(dstr!64("NaN111"), dstr!64("NaN222"),
+        RoundingMode.roundTiesToEven, f);
+    assert(r4.decode().coefficient == 111UL);
+
+    // Sign is preserved when a signaling NaN is quieted.
+    f = ExceptionFlag.none;
+    auto r5 = Decimal64.add(dstr!64("-sNaN5"), dstr!64("1"),
+        RoundingMode.roundTiesToEven, f);
+    assert(r5.isNaN() && !r5.isSignalingNaN() && r5.signbit());
+    assert(r5.decode().coefficient == 5UL);
+    assert(f == ExceptionFlag.invalidOperation);
+
+    // fma carries the payload of the first NaN it meets and quiets a signaling
+    // one (raising invalid); a quiet addend NaN raises nothing.
+    f = ExceptionFlag.none;
+    auto r6 = Decimal64.fma(dstr!64("sNaN7"), dstr!64("2"), dstr!64("3"),
+        RoundingMode.roundTiesToEven, f);
+    assert(r6.isNaN() && !r6.isSignalingNaN());
+    assert(r6.decode().coefficient == 7UL);
+    assert(f == ExceptionFlag.invalidOperation);
+
+    f = ExceptionFlag.none;
+    auto r7 = Decimal64.fma(dstr!64("2"), dstr!64("3"), dstr!64("NaN9"),
+        RoundingMode.roundTiesToEven, f);
+    assert(r7.decode().coefficient == 9UL);
+    assert(f == ExceptionFlag.none);
+}
+
+@safe unittest
+{
+    // Fused-multiply-add is computed with an unbounded intermediate product
+    // (a single rounding), so it can differ from a separate multiply-then-add.
+    //
+    // (10^16 - 1)^2 = 99999999999999980000000000000001 (32 digits).
+    // Adding -(first 16 digits scaled) leaves exactly 1 for fma, but a rounded
+    // multiply discards the trailing ...0001, so the separate path yields 0.
+    ExceptionFlag f;
+    auto a = dstr!64("9999999999999999");
+    auto b = dstr!64("9999999999999999");
+    auto c = dstr!64("-9.999999999999998E31");      // -(9999999999999998 x 10^16)
+
+    auto fused = Decimal64.fma(a, b, c, RoundingMode.roundTiesToEven, f);
+    assert(fused.toString() == "1");
+    assert(f == ExceptionFlag.none);                // exact: product+addend = 1
+
+    ExceptionFlag f2;
+    auto prod = Decimal64.mul(a, b, RoundingMode.roundTiesToEven, f2);
+    auto sep = Decimal64.add(prod, c, RoundingMode.roundTiesToEven, f2);
+    assert(sep.isZero());                           // rounding lost the low digit
+    assert(!fused.isZero());
+
+    // Exact-zero sign from fma follows the rounding mode, like add.
+    f = ExceptionFlag.none;
+    auto zNeg = Decimal64.fma(dstr!64("1"), dstr!64("1"), dstr!64("-1"),
+        RoundingMode.roundTowardNegative, f);
+    assert(zNeg.isZero() && zNeg.signbit());        // -0 toward -Inf
+    auto zPos = Decimal64.fma(dstr!64("1"), dstr!64("1"), dstr!64("-1"),
+        RoundingMode.roundTiesToEven, f);
+    assert(zPos.isZero() && !zPos.signbit());       // +0 otherwise
+}
+
+@safe unittest
+{
+    // Decimal-specific behaviour: cohorts, quanta and preferred exponents.
+    // (Radix-10 features that binary formats do not have.)
+    ExceptionFlag f;
+
+    // Equal value, distinct cohorts: 1.0, 1.00 and 1 differ in quantum.
+    assert(dstr!64("1.0").decode().exponent == -1);
+    assert(dstr!64("1.00").decode().exponent == -2);
+    assert(dstr!64("1").decode().exponent == 0);
+    assert(Decimal64.isEqual(dstr!64("1.0"), dstr!64("1.00")));
+
+    // Multiplication's preferred exponent is the sum of the operand exponents,
+    // so trailing zeros are retained: 2.50 x 4 = 10.00 (not 10).
+    auto p = Decimal64.mul(dstr!64("2.50"), dstr!64("4"),
+        RoundingMode.roundTiesToEven, f);
+    assert(p.toString() == "10.00");
+
+    // Zero has many cohorts; quantize selects the quantum exactly.
+    auto z = Decimal64.quantize(dstr!64("0"), dstr!64("1E-5"),
+        RoundingMode.roundTiesToEven, f);
+    assert(z.isZero() && z.decode().exponent == -5);
+    assert(z.toString() == "0.00000");
+
+    // logB and scaleB operate in powers of ten and reach into the subnormals.
+    f = ExceptionFlag.none;
+    assert(Decimal32.logB(Decimal32.trueMin(), f).toString() == "-101");
+    auto sb = Decimal32.scaleB(dstr!32("1"), -101, RoundingMode.roundTiesToEven, f);
+    assert(sb.rawValue() == Decimal32.trueMin().rawValue());
+    assert(sb.isSubnormal());
+}
+
+@safe unittest
+{
+    // Reproducibility: encodings are canonical and bit-identical, so a result
+    // is the same across conforming implementations.
+
+    // Parsing the same text always gives the same encoding (determinism).
+    static immutable string[] texts = [
+        "0", "1", "1.0", "1.00", "1.5", "0.001",
+        "123456789012345.6", "1.234567890123456E100", "9E-200",
+    ];
+    foreach (t; texts)
+    {
+        ExceptionFlag fa, fb;
+        Decimal64 a, b;
+        assert(Decimal64.fromString(t, a, fa));
+        assert(Decimal64.fromString(t, b, fb));
+        assert(a.rawValue() == b.rawValue(), t);
+
+        // Round-tripping through toString preserves the exact cohort.
+        Decimal64 c;
+        ExceptionFlag fc;
+        assert(Decimal64.fromString(a.toString(), c, fc));
+        assert(c.rawValue() == a.rawValue(), t);
+    }
+
+    // Signed zero survives a string round-trip unchanged.
+    {
+        ExceptionFlag fz;
+        auto nz = Decimal64.sub(dstr!64("0"), dstr!64("0"),
+            RoundingMode.roundTowardNegative, fz);
+        assert(nz.isZero() && nz.signbit());
+        Decimal64 back;
+        ExceptionFlag f;
+        assert(Decimal64.fromString(nz.toString(), back, f));
+        assert(back.rawValue() == nz.rawValue());
+    }
+
+    // A correctly-rounded operation has a single canonical encoding: 1/3
+    // computed twice is bit-identical.
+    ExceptionFlag f1, f2;
+    auto q1 = Decimal64.div(dstr!64("1"), dstr!64("3"), RoundingMode.roundTiesToEven, f1);
+    auto q2 = Decimal64.div(dstr!64("1"), dstr!64("3"), RoundingMode.roundTiesToEven, f2);
+    assert(q1.rawValue() == q2.rawValue());
+
+    // Non-canonical encodings are not produced by operations but must decode
+    // reproducibly: a coefficient above the maximum reads as a canonical zero.
+    {
+        alias F = DecimalFormat!64;
+        immutable ulong E = F.bias;                                  // exponent 0
+        immutable ulong G = (0b11UL << (F.expBits + 1)) | (E << 1) | 1UL; // large form, declet 9
+        immutable ulong T = (1UL << F.trailingBits) - 1;            // all trailing bits set
+        immutable ulong raw = (G << F.trailingBits) | T;
+        auto nc = Decimal64.fromRaw(raw);
+        assert(nc.isFinite() && nc.isZero());
+        assert(nc.decode().coefficient == 0UL);                     // canonical zero
+        assert(Decimal64.isEqual(nc, dstr!64("0")));
+    }
+}
+
+/*
+ * ----------------------------------------------------------------------
  * IBM FPgen decimal conformance vectors.
  *
  * The IBM FPgen ("Floating-Point Test Suite for IEEE") describes each test
@@ -3589,3 +3851,449 @@ version (unittest)
     ];
     foreach (v; vectors) runFPgen!128(v);
 }
+
+/*
+ * ----------------------------------------------------------------------
+ * Berkeley TestFloat (John Hauser) — decimal adaptation.
+ *
+ * TestFloat verifies, for every operation and every rounding mode, both the
+ * bit-exact result and the five IEEE exception flags. This block mirrors that
+ * methodology for the decimal formats, reusing TestFloat's own vocabulary:
+ *
+ *   operation   add  sub  mul  div  mulAdd  sqrt  rem  roundToInt
+ *               eq  le  lt  eq_signaling  le_quiet  lt_quiet
+ *   rounding    near_even   near_maxMag   minMag   min   max
+ *               (= roundTiesToEven, roundTiesToAway, toward zero,
+ *                  toward -Inf, toward +Inf)
+ *   flag chars  v invalid   i infinite (division-by-zero)
+ *               o overflow  u underflow   x inexact
+ *
+ * Operands and finite results use the cohort-exact `<digits>P<exp>` notation
+ * (shared with the FPgen block); comparisons yield `1`/`0`. Conversions to and
+ * from integers and between formats are exercised in dedicated blocks below.
+ * ----------------------------------------------------------------------
+ */
+version (unittest)
+{
+    private RoundingMode tfRounding(string r)
+    {
+        switch (r)
+        {
+            case "near_even":   return RoundingMode.roundTiesToEven;
+            case "near_maxMag": return RoundingMode.roundTiesToAway;
+            case "minMag":      return RoundingMode.roundTowardZero;
+            case "min":         return RoundingMode.roundTowardNegative;
+            case "max":         return RoundingMode.roundTowardPositive;
+            default: assert(false, "TestFloat: bad rounding '" ~ r ~ "'");
+        }
+    }
+
+    private ExceptionFlag tfFlags(string s)
+    {
+        ExceptionFlag f;
+        foreach (c; s) switch (c)
+        {
+            case 'x': f |= ExceptionFlag.inexact; break;
+            case 'u': f |= ExceptionFlag.underflow; break;
+            case 'o': f |= ExceptionFlag.overflow; break;
+            case 'i': f |= ExceptionFlag.divisionByZero; break;   // "infinite"
+            case 'v': f |= ExceptionFlag.invalidOperation; break; // "invalid"
+            default: assert(false, "TestFloat: bad flag char");
+        }
+        return f;
+    }
+
+    private string tfFlagDump(ExceptionFlag f)
+    {
+        string s;
+        if (f & ExceptionFlag.invalidOperation) s ~= "v";
+        if (f & ExceptionFlag.divisionByZero)   s ~= "i";
+        if (f & ExceptionFlag.overflow)         s ~= "o";
+        if (f & ExceptionFlag.underflow)        s ~= "u";
+        if (f & ExceptionFlag.inexact)          s ~= "x";
+        return s.length ? s : "(none)";
+    }
+
+    /// IEEE roundToIntegralExact with TestFloat's `exact` semantics: raises
+    /// inexact when the value is changed.
+    private Decimal!bits tfRoundToInt(int bits)(Decimal!bits a,
+        RoundingMode mode, ref ExceptionFlag flags)
+    {
+        alias D = Decimal!bits;
+        if (a.isSignalingNaN())
+        {
+            flags |= ExceptionFlag.invalidOperation;
+            return D.nan();
+        }
+        if (a.isNaN() || a.isInfinity())
+            return a;
+        immutable dec = a.decode();
+        if (dec.exponent >= 0)
+            return a;                       // already integral
+        bool inexact = false;
+        auto quo = D.divPow10Round(toU256(dec.coefficient), -dec.exponent,
+            dec.sign, mode, inexact);
+        if (inexact)
+            flags |= ExceptionFlag.inexact;
+        return D.roundToPrecision(dec.sign, quo, 0, mode, flags);
+    }
+
+    /// Convert a signed 64-bit integer to a decimal, rounding per `mode`.
+    private Decimal!bits tfI64ToDec(int bits)(long v,
+        RoundingMode mode, ref ExceptionFlag flags)
+    {
+        immutable sign = v < 0;
+        immutable ulong mag = sign ? (~cast(ulong) v + 1) : cast(ulong) v;
+        return Decimal!bits.roundToPrecision(sign, UInt256(mag), 0, mode, flags);
+    }
+
+    /// Convert a decimal to a signed 64-bit integer, rounding per `mode` and
+    /// saturating with `invalid` on out-of-range/NaN/infinite inputs.
+    private long tfDecToI64(int bits)(Decimal!bits a,
+        RoundingMode mode, ref ExceptionFlag flags)
+    {
+        alias D = Decimal!bits;
+        if (a.isNaN())
+        {
+            flags |= ExceptionFlag.invalidOperation;
+            return long.min;
+        }
+        if (a.isInfinity())
+        {
+            flags |= ExceptionFlag.invalidOperation;
+            return a.signbit() ? long.min : long.max;
+        }
+        immutable dec = a.decode();
+        if (toU256(dec.coefficient).isZero)
+            return 0;
+        if (dec.exponent >= 20)             // |value| >= 10^19 > i64 range
+        {
+            flags |= ExceptionFlag.invalidOperation;
+            return dec.sign ? long.min : long.max;
+        }
+        UInt256 c = toU256(dec.coefficient);
+        bool inexact = false;
+        if (dec.exponent > 0)
+            c = D.scaleU256(c, dec.exponent);
+        else if (dec.exponent < 0)
+            c = D.divPow10Round(c, -dec.exponent, dec.sign, mode, inexact);
+
+        immutable posMax = UInt256(0x7FFF_FFFF_FFFF_FFFFUL);
+        immutable negMax = UInt256(0x8000_0000_0000_0000UL);
+        if (!dec.sign)
+        {
+            if (c.opCmp(posMax) > 0)
+            {
+                flags |= ExceptionFlag.invalidOperation;
+                return long.max;
+            }
+        }
+        else
+        {
+            if (c.opCmp(negMax) > 0)
+            {
+                flags |= ExceptionFlag.invalidOperation;
+                return long.min;
+            }
+            if (c.opCmp(negMax) == 0)
+            {
+                if (inexact) flags |= ExceptionFlag.inexact;
+                return long.min;
+            }
+        }
+        if (inexact) flags |= ExceptionFlag.inexact;
+        immutable ulong mag = c.toUInt128().lo;
+        return dec.sign ? -cast(long) mag : cast(long) mag;
+    }
+
+    /// Convert between decimal formats, rounding per `mode`.
+    private Decimal!tb tfConvert(int sb, int tb)(Decimal!sb a,
+        RoundingMode mode, ref ExceptionFlag flags)
+    {
+        alias DT = Decimal!tb;
+        if (a.isSignalingNaN())
+        {
+            flags |= ExceptionFlag.invalidOperation;
+            return DT.nan();
+        }
+        if (a.isNaN())
+            return DT.nan();
+        if (a.isInfinity())
+            return DT.encodeInfinity(a.signbit());
+        immutable dec = a.decode();
+        return DT.roundToPrecision(dec.sign, toU256(dec.coefficient),
+            dec.exponent, mode, flags);
+    }
+
+    private void runTF(int bits)(string line)
+    {
+        alias D = Decimal!bits;
+        auto tok = fpSplit(line);
+        size_t arrow = tok.length;
+        foreach (k, t; tok) if (t == "->") { arrow = k; break; }
+        assert(arrow < tok.length, "TestFloat: missing '->': " ~ line);
+
+        immutable op = tok[0];
+        immutable mode = tfRounding(tok[1]);
+        auto ops = tok[2 .. arrow];
+        immutable res = tok[arrow + 1];
+        immutable flagTok = (arrow + 2 < tok.length) ? tok[arrow + 2] : "";
+        ExceptionFlag f;
+
+        switch (op)
+        {
+            case "add":
+                fpCheck!bits(D.add(fpParse!bits(ops[0]), fpParse!bits(ops[1]), mode, f), res, line);
+                break;
+            case "sub":
+                fpCheck!bits(D.sub(fpParse!bits(ops[0]), fpParse!bits(ops[1]), mode, f), res, line);
+                break;
+            case "mul":
+                fpCheck!bits(D.mul(fpParse!bits(ops[0]), fpParse!bits(ops[1]), mode, f), res, line);
+                break;
+            case "div":
+                fpCheck!bits(D.div(fpParse!bits(ops[0]), fpParse!bits(ops[1]), mode, f), res, line);
+                break;
+            case "mulAdd":
+                fpCheck!bits(D.fma(fpParse!bits(ops[0]), fpParse!bits(ops[1]),
+                    fpParse!bits(ops[2]), mode, f), res, line);
+                break;
+            case "sqrt":
+                fpCheck!bits(D.sqrt(fpParse!bits(ops[0]), mode, f), res, line);
+                break;
+            case "rem":
+                fpCheck!bits(D.remainder(fpParse!bits(ops[0]), fpParse!bits(ops[1]), f), res, line);
+                break;
+            case "roundToInt":
+                fpCheck!bits(tfRoundToInt!bits(fpParse!bits(ops[0]), mode, f), res, line);
+                break;
+            case "eq": case "le": case "lt":
+            case "eq_signaling": case "le_quiet": case "lt_quiet":
+                immutable a = fpParse!bits(ops[0]);
+                immutable b = fpParse!bits(ops[1]);
+                immutable anyNaN = a.isNaN() || b.isNaN();
+                immutable anySNaN = a.isSignalingNaN() || b.isSignalingNaN();
+                bool u;
+                immutable c = D.compareValue(a, b, u);
+                bool cmpVal;
+                bool signalAnyNaN;
+                switch (op)
+                {
+                    case "eq":           signalAnyNaN = false; cmpVal = !u && c == 0; break;
+                    case "eq_signaling": signalAnyNaN = true;  cmpVal = !u && c == 0; break;
+                    case "le":           signalAnyNaN = true;  cmpVal = !u && c <= 0; break;
+                    case "lt":           signalAnyNaN = true;  cmpVal = !u && c < 0;  break;
+                    case "le_quiet":     signalAnyNaN = false; cmpVal = !u && c <= 0; break;
+                    case "lt_quiet":     signalAnyNaN = false; cmpVal = !u && c < 0;  break;
+                    default: assert(false);
+                }
+                if ((signalAnyNaN && anyNaN) || (!signalAnyNaN && anySNaN))
+                    f |= ExceptionFlag.invalidOperation;
+                assert(cmpVal == (res == "1"),
+                    line ~ "  [cmp got " ~ (cmpVal ? "1" : "0") ~ "]");
+                break;
+            default:
+                assert(false, "TestFloat: unsupported op '" ~ op ~ "'");
+        }
+        assert(f == tfFlags(flagTok),
+            line ~ "  [flags got " ~ tfFlagDump(f) ~ "]");
+    }
+}
+
+@safe unittest
+{
+    // TestFloat — dec64 add/sub/mul/div across the five rounding modes.
+    static immutable string[] vectors = [
+        "add near_even 1P0 1P0 -> 2P0",
+        "add near_even 12P-1 34P-1 -> 46P-1",
+        "add near_even 1P0 -1P0 -> 0P0",
+        "add min 1P0 -1P0 -> -0P0",            // exact zero is -0 toward -Inf
+        "sub near_even 5P0 5P0 -> 0P0",
+        "sub near_even 30P-1 12P-1 -> 18P-1",
+        "mul near_even 2P0 3P0 -> 6P0",
+        "mul near_even -2P0 3P0 -> -6P0",
+        "div near_even 6P0 2P0 -> 3P0",
+        "div near_even 1P0 2P0 -> 5P-1",
+        // 1/3 under every rounding mode (TestFloat's signature stress case).
+        "div near_even   1P0 3P0 -> 3333333333333333P-16 x",
+        "div near_maxMag 1P0 3P0 -> 3333333333333333P-16 x",
+        "div minMag      1P0 3P0 -> 3333333333333333P-16 x",
+        "div min         1P0 3P0 -> 3333333333333333P-16 x",
+        "div max         1P0 3P0 -> 3333333333333334P-16 x",
+        // 2/3 under every rounding mode.
+        "div near_even   2P0 3P0 -> 6666666666666667P-16 x",
+        "div near_maxMag 2P0 3P0 -> 6666666666666667P-16 x",
+        "div minMag      2P0 3P0 -> 6666666666666666P-16 x",
+        "div min         2P0 3P0 -> 6666666666666666P-16 x",
+        "div max         2P0 3P0 -> 6666666666666667P-16 x",
+    ];
+    foreach (v; vectors) runTF!64(v);
+}
+
+@safe unittest
+{
+    // TestFloat — invalid, infinite (division-by-zero) and special operands.
+    static immutable string[] vectors = [
+        "add near_even +Inf -Inf -> Q v",
+        "sub near_even +Inf +Inf -> Q v",
+        "mul near_even 0P0 +Inf -> Q v",
+        "div near_even 1P0 0P0 -> +Inf i",     // "infinite" = division-by-zero
+        "div near_even -1P0 0P0 -> -Inf i",
+        "div near_even 0P0 0P0 -> Q v",
+        "div near_even +Inf +Inf -> Q v",
+        "sqrt near_even -1P0 -> Q v",
+        "rem near_even 1P0 0P0 -> Q v",
+        "add near_even S 1P0 -> Q v",          // signaling NaN propagates invalid
+        "add near_even Q 1P0 -> Q",            // quiet NaN, no flag
+        "mulAdd near_even 0P0 +Inf 1P0 -> Q v",
+    ];
+    foreach (v; vectors) runTF!64(v);
+}
+
+@safe unittest
+{
+    // TestFloat — mulAdd, sqrt and IEEE remainder.
+    static immutable string[] vectors = [
+        "mulAdd near_even 2P0 3P0 1P0 -> 7P0",
+        "mulAdd near_even 15P-1 15P-1 75P-2 -> 300P-2",
+        "sqrt near_even 4P0 -> 2P0",
+        "sqrt near_even 9P0 -> 3P0",
+        "sqrt near_even 25P-2 -> 5P-1",
+        "sqrt near_even 2P0 -> 1414213562373095P-15 x",
+        "sqrt near_even +Inf -> +Inf",
+        "rem near_even 5P0 3P0 -> -1P0",
+        "rem near_even 7P0 3P0 -> 1P0",
+        "rem near_even 10P0 3P0 -> 1P0",
+        "rem near_even 9P0 3P0 -> 0P0",
+    ];
+    foreach (v; vectors) runTF!64(v);
+}
+
+@safe unittest
+{
+    // TestFloat — roundToInt under every rounding mode (exact = inexact flag).
+    static immutable string[] vectors = [
+        "roundToInt near_even   15P-1 -> 2P0 x",   // 1.5 -> 2
+        "roundToInt near_even   25P-1 -> 2P0 x",   // 2.5 -> 2 (ties to even)
+        "roundToInt near_maxMag 25P-1 -> 3P0 x",   // 2.5 -> 3 (ties away)
+        "roundToInt minMag      15P-1 -> 1P0 x",   // toward zero
+        "roundToInt min         15P-1 -> 1P0 x",
+        "roundToInt max         15P-1 -> 2P0 x",
+        "roundToInt min        -15P-1 -> -2P0 x",
+        "roundToInt max        -15P-1 -> -1P0 x",
+        "roundToInt near_even    4P-1 -> 0P0 x",   // 0.4 -> 0
+        "roundToInt near_even   10P0 -> 10P0",     // already integral, no flag
+        "roundToInt near_even  123P0 -> 123P0",
+        "roundToInt near_even  100P-2 -> 1P0",     // 1.00 -> 1, exact
+    ];
+    foreach (v; vectors) runTF!64(v);
+}
+
+@safe unittest
+{
+    // TestFloat — the six comparison predicates, including NaN signaling rules.
+    static immutable string[] vectors = [
+        "eq near_even 1P0 1P0 -> 1",
+        "eq near_even 1P0 2P0 -> 0",
+        "eq near_even 150P-2 15P-1 -> 1",          // 1.50 == 1.5 (different cohort)
+        "eq near_even 0P0 -0P0 -> 1",              // +0 == -0
+        "eq near_even Q 1P0 -> 0",                 // quiet eq: quiet NaN, no flag
+        "eq near_even S 1P0 -> 0 v",               // quiet eq: signaling NaN -> invalid
+        "lt near_even 1P0 2P0 -> 1",
+        "lt near_even 2P0 1P0 -> 0",
+        "lt near_even -0P0 0P0 -> 0",
+        "lt near_even Q 1P0 -> 0 v",               // signaling lt: any NaN -> invalid
+        "le near_even 1P0 1P0 -> 1",
+        "le near_even 2P0 1P0 -> 0",
+        "le near_even Q 1P0 -> 0 v",
+        "eq_signaling near_even 1P0 1P0 -> 1",
+        "eq_signaling near_even Q 1P0 -> 0 v",     // signaling eq: any NaN -> invalid
+        "lt_quiet near_even 1P0 2P0 -> 1",
+        "lt_quiet near_even Q 1P0 -> 0",           // quiet lt: quiet NaN, no flag
+        "lt_quiet near_even S 1P0 -> 0 v",
+        "le_quiet near_even 1P0 1P0 -> 1",
+        "le_quiet near_even Q 1P0 -> 0",
+    ];
+    foreach (v; vectors) runTF!64(v);
+}
+
+@safe unittest
+{
+    // TestFloat — i64 <-> decimal conversions.
+    ExceptionFlag f;
+
+    // i64 -> dec64 (exact for values within 16 digits).
+    assert(tfI64ToDec!64(0, RoundingMode.roundTiesToEven, f).rawValue()
+        == fpParse!64("0P0").rawValue() && f == ExceptionFlag.none);
+    assert(tfI64ToDec!64(12345, RoundingMode.roundTiesToEven, f).rawValue()
+        == fpParse!64("12345P0").rawValue());
+    assert(tfI64ToDec!64(-100, RoundingMode.roundTiesToEven, f).rawValue()
+        == fpParse!64("-100P0").rawValue());
+
+    // i64 -> dec32 rounds (only 7 digits of precision).
+    f = ExceptionFlag.none;
+    auto d = tfI64ToDec!32(12345678, RoundingMode.roundTiesToEven, f);
+    assert(d.rawValue() == fpParse!32("1234568P1").rawValue());
+    assert(f & ExceptionFlag.inexact);
+
+    // dec64 -> i64 with rounding and range checks.
+    f = ExceptionFlag.none;
+    assert(tfDecToI64!64(fpParse!64("25P-1"), RoundingMode.roundTiesToEven, f) == 2);
+    assert(f & ExceptionFlag.inexact);
+    f = ExceptionFlag.none;
+    assert(tfDecToI64!64(fpParse!64("25P-1"), RoundingMode.roundTiesToAway, f) == 3);
+    f = ExceptionFlag.none;
+    assert(tfDecToI64!64(fpParse!64("-15P-1"), RoundingMode.roundTowardNegative, f) == -2);
+    f = ExceptionFlag.none;
+    assert(tfDecToI64!64(fpParse!64("123P0"), RoundingMode.roundTiesToEven, f) == 123);
+    assert(f == ExceptionFlag.none);
+
+    // Out of range and NaN/infinite saturate with invalid.
+    f = ExceptionFlag.none;
+    assert(tfDecToI64!64(fpParse!64("1P30"), RoundingMode.roundTiesToEven, f) == long.max);
+    assert(f & ExceptionFlag.invalidOperation);
+    f = ExceptionFlag.none;
+    assert(tfDecToI64!64(Decimal64.nan(), RoundingMode.roundTiesToEven, f) == long.min);
+    assert(f & ExceptionFlag.invalidOperation);
+    f = ExceptionFlag.none;
+    assert(tfDecToI64!64(Decimal64.infinity(), RoundingMode.roundTiesToEven, f) == long.max);
+    assert(f & ExceptionFlag.invalidOperation);
+}
+
+@safe unittest
+{
+    // TestFloat — conversions between decimal formats.
+    ExceptionFlag f;
+
+    // Widening dec32 -> dec64 is exact.
+    auto wide = tfConvert!(32, 64)(dstr!32("1.5"), RoundingMode.roundTiesToEven, f);
+    assert(Decimal64.isEqual(wide, dstr!64("1.5")));
+    assert(f == ExceptionFlag.none);
+
+    // Narrowing dec64 -> dec32 rounds to 7 digits.
+    f = ExceptionFlag.none;
+    auto narrow = tfConvert!(64, 32)(dstr!64("1.234567890123456"),
+        RoundingMode.roundTiesToEven, f);
+    assert(narrow.rawValue() == fpParse!32("1234568P-6").rawValue());
+    assert(f & ExceptionFlag.inexact);
+
+    // Specials pass through; a signaling NaN raises invalid and quiets.
+    f = ExceptionFlag.none;
+    assert(tfConvert!(64, 32)(Decimal64.infinity(), RoundingMode.roundTiesToEven, f).isInfinity);
+    assert(f == ExceptionFlag.none);
+    f = ExceptionFlag.none;
+    Decimal64 snan;
+    ExceptionFlag pf;
+    Decimal64.fromString("sNaN", snan, pf);
+    auto q = tfConvert!(64, 32)(snan, RoundingMode.roundTiesToEven, f);
+    assert(q.isNaN() && !q.isSignalingNaN());
+    assert(f & ExceptionFlag.invalidOperation);
+
+    // Overflow on narrowing to dec32 (emax 96).
+    f = ExceptionFlag.none;
+    auto big = tfConvert!(64, 32)(dstr!64("1e200"), RoundingMode.roundTiesToEven, f);
+    assert(big.isInfinity());
+    assert(f & ExceptionFlag.overflow);
+    assert(f & ExceptionFlag.inexact);
+}
+
