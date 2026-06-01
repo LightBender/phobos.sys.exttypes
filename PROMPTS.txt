@@ -1,3 +1,6 @@
+Decimal
+-------
+
 In the decimal.d file, implement a fully IEEE-754-2008 compliant decimal type. Use intel's binary decimal encoding. Support all D mathematical and comparison operators. Support conversion to doubles, floats, and strings. Please include unit tests to test all aspect of the IEEE-754-2008 standard.
 
 Can you implement unit tests that cover the decimal portion of the IBM FPgen test suite?
@@ -7,3 +10,13 @@ Next I would like to add unit tests that replicate the TestFloat suite from John
 Finally I would like to add tests to cover edge cases beyond basic vectors including: all four rounding modes, subnormal handling and tininess detection, NaN payload propagation (quiet vs. signaling), decimal-specific features (if supported), fused multiply-add (FMA) exactness, and reproducible results across implementations. You do not need to reproduce any edge case tests that the existing unit tests already handle. You can add them between the Phase 6 tests and that FPgen tests.
 
 Using the attached code coverage file, can you determine if there are any additional tests that could be added to improve coverage? 100% is not a hard requirement. Please add any new tests above the FPgen tests.
+
+Network Addresses
+-----------------
+
+In the network.d file we would like to create types for representing IP and MAC addresses. We will support both IPv4 and IPv6, including CIDR type address. For MAC addresses we will support both regular MAC addresses and EUI-64 MAC addresses. These types are for representation and storage purposes only so efficient storage and parsing are the key goals. Struct is the preferred data structure type. Another goal is to minimize the usage of Phobos as these types are intended for the new Phobos 3 library currently under development and minimal Phobos usage will make it easier to integrate them later.
+
+SemVer 2.0
+----------
+
+
